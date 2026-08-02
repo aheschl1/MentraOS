@@ -1025,10 +1025,17 @@ class MantleManager {
           endDate: Math.floor(end.getTime() / 1000),
         }
       })
-      try {
-        await BluetoothSdk.setCalendarEvents(shapedEvents)
-      } catch (error) {
-        console.warn("MANTLE: Failed to sync calendar events to glasses", error)
+      console.log(`MANTLE: calendar sync: calendars=${calendars.length} pushing=${shapedEvents.length} event(s)`)
+      // Write through the settings store, NOT BluetoothSdk.setCalendarEvents():
+      // `calendar_events` is a BLUETOOTH_SETTING_KEY, so every full push
+      // (pushAllBluetoothSettings before connect, pushDeviceSettingsOnConnect on
+      // the connected transition) overwrites the native DeviceStore copy with
+      // whatever the store holds. Writing straight to native left the store at
+      // its default `[]`, so those pushes wiped the events before the glasses
+      // were ready and G2's connect replay sent a calendar-clear instead.
+      const res = await engine.settings.set(SETTINGS.calendar_events.key, shapedEvents)
+      if (res.is_error()) {
+        console.warn("MANTLE: Failed to sync calendar events to glasses", res.error)
       }
     } catch (error) {
       // it's fine if this fails
