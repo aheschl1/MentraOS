@@ -33,6 +33,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
@@ -40,6 +41,7 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 
 // ---------- G2 Protocol Constants ----------
@@ -1697,35 +1699,195 @@ class G2 : SGCManager() {
     // Scanning
     private var scanCallback: ScanCallback? = null
 
-    // GATT operation queue for descriptor writes
-    private val gattOpQueue = mutableListOf<() -> Unit>()
-    private var gattOpInProgress = false
-
     // ---------- BLE Sending ----------
 
-    // Min gap between BLE packets when bursting many in a row. Android serializes one in-flight
-    // GATT op at a time even for WRITE_TYPE_NO_RESPONSE, so back-to-back writeCharacteristic() in
-    // a tight loop drops packets silently. iOS gets this for free via CoreBluetooth; we don't.
-    // Matches the 8 ms G1.java uses for its bitmap chunk loop (ANDROID_CHUNK_DELAY_MS).
-    private val BLE_PACKET_GAP_MS = 8L
+    // Characteristic writes retire within a connection interval (~11 ms at high priority), so
+    // this is a backstop against a wedged link, not a working value.
+    private val GATT_WRITE_TIMEOUT_MS = 250L
 
-    // Dedicated single-thread executor for pacing BLE packet bursts. We must NOT spread the burst
-    // across [mainHandler]: the incoming image ACK is also delivered on the main thread, and a long
-    // run of postDelayed writes (plus heartbeats and the text-queue tick) can push ACK processing
-    // past IMG_ACK_TIMEOUT_MS — the glasses appear to "stop responding" even though the ACK arrived.
-    // Pacing here keeps the main looper free so ACKs are processed promptly.
-    private val bleWriteExecutor: java.util.concurrent.ExecutorService =
+    // Descriptor writes are full ATT round trips issued during the connect storm. Giving up early
+    // here leaves notifications disabled — a dead connection — so be generous.
+    private val GATT_DESCRIPTOR_TIMEOUT_MS = 2000L
+
+    // Single thread carrying every GATT op on both legs: characteristic writes and the descriptor
+    // writes that enable notifications. Blocking ops must stay off the main looper, which
+    // delivers the image ACK and would starve it past IMG_ACK_TIMEOUT_MS. One thread also makes
+    // ordering FIFO across all callers and means ops are never issued concurrently.
+    @Volatile private var gattOpThread: Thread? = null
+
+    private val gattOpExecutor: java.util.concurrent.ExecutorService =
         java.util.concurrent.Executors.newSingleThreadExecutor { r ->
-            Thread(r, "G2-ble-write").apply { isDaemon = true }
+            Thread(r, "G2-gatt-op").apply {
+                isDaemon = true
+                gattOpThread = this
+            }
         }
 
+    /** The same thread, as a coroutine dispatcher for the suspend-side callers (the file service). */
+    private val gattOpDispatcher = gattOpExecutor.asCoroutineDispatcher()
+
+    /**
+     * One leg's GATT ops. Android keeps a single op in flight per connection, shared by
+     * characteristic and descriptor writes alike — whichever loses the race is refused outright,
+     * the packet never sent. So every op on a leg goes through here, and the next isn't issued
+     * until the stack reports the previous one retired via the write callbacks, which fire for
+     * WRITE_TYPE_NO_RESPONSE too, on handoff to the controller. The link paces the sender;
+     * nothing here estimates timing.
+     *
+     * The blocking entry points all run on the single op thread — never the main looper — so
+     * they are never concurrent with themselves. Only completion signalling and aborts arrive
+     * from other threads.
+     */
+    private inner class GattLeg(val name: String) {
+        private val isLeft = name == "LEFT"
+        private val gatt get() = if (isLeft) leftGatt else rightGatt
+        private val uiChar get() = if (isLeft) leftWriteChar else rightWriteChar
+        private val fileChar get() = if (isLeft) null else rightFileWriteChar
+
+        @Volatile private var pendingUuid: UUID? = null
+        @Volatile private var pendingIsDescriptor = false
+        @Volatile private var pending: java.util.concurrent.CountDownLatch? = null
+
+        /** One packet to the leg's UI characteristic. No-ops if the leg isn't bound. */
+        fun writeUi(packet: ByteArray) = writePacket(uiChar, packet, log = false)
+
+        /** One packet to the leg's FILE characteristic (right leg only), logged per write. */
+        fun writeFile(packet: ByteArray) = writePacket(fileChar, packet, log = true)
+
+        @Suppress("deprecation")
+        private fun writePacket(
+            char: BluetoothGattCharacteristic?,
+            packet: ByteArray,
+            log: Boolean
+        ) {
+            val gatt = gatt
+            if (char == null || gatt == null) return
+            char.value = packet
+            char.writeType = BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
+            val ok =
+                execute(char.uuid, isDescriptor = false, timeoutMs = GATT_WRITE_TIMEOUT_MS) {
+                    gatt.writeCharacteristic(char)
+                }
+            bgcapNoteWriteResult(ok) // BGCAP
+            if (log) {
+                Bridge.log("G2/FILE: write $name ${packet.size}B${if (ok) "" else " — FAILED"}")
+            }
+        }
+
+        /**
+         * Subscribe to [characteristic]'s notifications via its CCC descriptor. The descriptor
+         * write takes the same slot as packet writes, so running here serializes it against
+         * sends. [gatt] comes from the discovery callback rather than the leg's field so setup
+         * targets the connection that discovered the char.
+         */
+        @Suppress("deprecation")
+        fun subscribe(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic) {
+            // Local bookkeeping only — takes no slot.
+            gatt.setCharacteristicNotification(characteristic, true)
+
+            val descriptor = characteristic.getDescriptor(G2BLE.CLIENT_CHARACTERISTIC_CONFIG)
+            if (descriptor == null) {
+                Bridge.log("G2/GATT: $name ${characteristic.uuid} has no CCC descriptor — not subscribed")
+                return
+            }
+            descriptor.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+            val ok =
+                execute(
+                    characteristic.uuid,
+                    isDescriptor = true,
+                    timeoutMs = GATT_DESCRIPTOR_TIMEOUT_MS
+                ) {
+                    gatt.writeDescriptor(descriptor)
+                }
+            if (!ok) {
+                Bridge.log("G2/GATT: $name FAILED to subscribe ${characteristic.uuid}")
+            }
+        }
+
+        /** BLE callback thread: a characteristic write retired. Failed ops retire too. */
+        fun onCharacteristicRetired(uuid: UUID) = complete(uuid, isDescriptor = false)
+
+        /**
+         * BLE callback thread: a descriptor write retired. Keyed on its characteristic — every
+         * notify descriptor here is a 0x2902.
+         */
+        fun onDescriptorRetired(descriptor: BluetoothGattDescriptor) {
+            descriptor.characteristic?.let { complete(it.uuid, isDescriptor = true) }
+        }
+
+        /** Release a waiter whose connection went away, rather than let it serve out the timeout. */
+        fun abort() {
+            pending?.countDown()
+            clearPending()
+        }
+
+        /**
+         * Issue one op and wait for it to retire. [uuid] is the *characteristic* in both cases —
+         * the notify descriptors all share 0x2902. Returns false if the op was refused or never
+         * retired; logged either way.
+         */
+        private fun execute(
+            uuid: UUID,
+            isDescriptor: Boolean,
+            timeoutMs: Long,
+            issue: () -> Boolean
+        ): Boolean {
+            if (Thread.currentThread() !== gattOpThread) {
+                Bridge.log("G2/GATT: $name op issued off the op thread — serialization broken")
+            }
+            val latch = java.util.concurrent.CountDownLatch(1)
+            // Claim the slot *before* issuing, so a completion that lands immediately isn't missed.
+            pendingUuid = uuid
+            pendingIsDescriptor = isDescriptor
+            pending = latch
+
+            if (!issue()) {
+                // Refused with the slot free: the connection is gone, or something bypassed us.
+                clearPending()
+                Bridge.log("G2/GATT: $name op REFUSED though our slot was free — uuid=$uuid descriptor=$isDescriptor")
+                return false
+            }
+
+            val retired =
+                try {
+                    latch.await(timeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS)
+                } catch (_: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                    false
+                }
+            clearPending()
+            if (!retired) {
+                Bridge.log("G2/GATT: $name op did not retire in ${timeoutMs}ms — uuid=$uuid descriptor=$isDescriptor")
+            }
+            return retired
+        }
+
+        /**
+         * A completion we timed out on can land while the next op is pending and release it
+         * early; the op after is then refused, which leaves the slot free again — the state
+         * recovers on its own.
+         */
+        private fun complete(uuid: UUID, isDescriptor: Boolean) {
+            if (uuid == pendingUuid && isDescriptor == pendingIsDescriptor) pending?.countDown()
+        }
+
+        private fun clearPending() {
+            pendingUuid = null
+            pending = null
+        }
+    }
+
+    private val leftLeg = GattLeg("LEFT")
+    private val rightLeg = GattLeg("RIGHT")
+
+    private fun legFor(side: String): GattLeg = if (side == "LEFT") leftLeg else rightLeg
+
     @Suppress("deprecation")
-    // BGCAP diagnostic: Android G2's text path is already direct (single packet -> writeOnePacket),
-    // so the iOS root cause (the canSend gate) does NOT exist here. This measures whether
-    // writeCharacteristic is being REJECTED (returns false = Android GATT stack busy/throttled, the
-    // packet is dropped) in the background — the suspected Android accumulation/loss point. The
-    // current code discards the return value. Rate-limited; "BGCAP:" prefix; remove after the
-    // Android repro pins the mechanism.
+    // BGCAP diagnostic: Android G2's text path is already direct (single packet -> sendToGlasses),
+    // so the iOS root cause (the canSend gate) does NOT exist here. This counts writes that failed
+    // to land — refused by the stack, or never retired — in the background, the suspected Android
+    // accumulation/loss point. Rate-limited; "BGCAP:" prefix; remove after the Android repro pins
+    // the mechanism.
     private var bgcapWriteOk = 0
     private var bgcapWriteFail = 0
     private var bgcapWriteLogAt = 0L
@@ -1735,39 +1897,12 @@ class G2 : SGCManager() {
         val now = android.os.SystemClock.uptimeMillis()
         if (now - bgcapWriteLogAt >= 1000) {
             if (bgcapWriteOk > 0 || bgcapWriteFail > 0) {
-                Bridge.log("BGCAP: g2 writeCharacteristic ok=$bgcapWriteOk fail=$bgcapWriteFail in ${now - bgcapWriteLogAt}ms (fail = stack busy/dropped)")
+                Bridge.log("BGCAP: g2 writeCharacteristic ok=$bgcapWriteOk fail=$bgcapWriteFail in ${now - bgcapWriteLogAt}ms (fail = refused or never retired)")
             }
             bgcapWriteOk = 0
             bgcapWriteFail = 0
             bgcapWriteLogAt = now
         }
-    }
-
-    /**
-     * One characteristic write. Shared by the UI path ([writeOnePacket]) and the file path
-     * ([writeFilePackets]), which differ only in the characteristic pair they target. No-ops if
-     * the leg isn't bound. [leg] non-null also logs the write — file transfers only; the UI path
-     * is far too hot for that.
-     */
-    private fun writeTo(
-        char: BluetoothGattCharacteristic?,
-        gatt: BluetoothGatt?,
-        packet: ByteArray,
-        leg: String?
-    ) {
-        if (char == null || gatt == null) return
-        char.value = packet
-        char.writeType = BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
-        val ok = gatt.writeCharacteristic(char)
-        bgcapNoteWriteResult(ok) // BGCAP
-        if (leg != null) {
-            Bridge.log("G2/FILE: write $leg ${packet.size}B -> ${if (ok) "queued" else "DROPPED (stack busy)"}")
-        }
-    }
-
-    private fun writeOnePacket(packet: ByteArray, left: Boolean, right: Boolean) {
-        if (right) writeTo(rightWriteChar, rightGatt, packet, null)
-        if (left) writeTo(leftWriteChar, leftGatt, packet, null)
     }
 
     private fun sendToGlasses(
@@ -1777,26 +1912,12 @@ class G2 : SGCManager() {
     ) {
         // Bridge.log("G2: sendToGlasses() - sending ${packets.size} packets first byte: ${packets[0][0]}")
         if (packets.isEmpty()) return
-        // Single-packet sends (the common case for text/settings) go straight through.
-        if (packets.size == 1) {
-            writeOnePacket(packets[0], left, right)
-            return
-        }
-        // Multi-packet bursts (bitmaps, large protobufs): pace the whole burst on a dedicated
-        // write thread with a blocking gap between packets, so the Android BLE stack can drain each
-        // write before the next is queued WITHOUT occupying the main looper (which also carries the
-        // image ACK and would otherwise starve it under load — see [bleWriteExecutor]).
-        bleWriteExecutor.execute {
-            for (i in packets.indices) {
-                writeOnePacket(packets[i], left, right)
-                if (i < packets.size - 1) {
-                    try {
-                        Thread.sleep(BLE_PACKET_GAP_MS)
-                    } catch (_: InterruptedException) {
-                        Thread.currentThread().interrupt()
-                        return@execute
-                    }
-                }
+        // Every send — single-packet ones included — goes through the op thread, so bursts from
+        // any caller are paced by the link instead of racing the one-op-per-connection stack.
+        gattOpExecutor.execute {
+            for (packet in packets) {
+                if (right) rightLeg.writeUi(packet)
+                if (left) leftLeg.writeUi(packet)
             }
         }
     }
@@ -1901,18 +2022,19 @@ class G2 : SGCManager() {
      * ATT 0x0882/0x0884 active only there. Both legs expose the characteristic; the glasses relay
      * internally.
      *
-     * Paced like [sendToGlasses] — back-to-back WRITE_TYPE_NO_RESPONSE writes in a multi-fragment
-     * body get dropped as "stack busy" and read as an ack timeout. suspend + delay so the gap
-     * doesn't block the main looper.
+     * Runs on the op thread: the file characteristic shares the right leg's one slot with the
+     * UI one, so an unserialized UI write mid-transfer would drop packets and read as an ack
+     * timeout. withContext keeps the blocking writes off the main dispatcher.
      */
     private suspend fun writeFilePackets(packets: List<ByteArray>) {
         if (rightFileWriteChar == null) {
             Bridge.log("G2/FILE: no FILE WRITE characteristic bound — cannot send")
             return
         }
-        for ((index, packet) in packets.withIndex()) {
-            if (index > 0) delay(BLE_PACKET_GAP_MS)
-            writeTo(rightFileWriteChar, rightGatt, packet, "RIGHT")
+        withContext(gattOpDispatcher) {
+            for (packet in packets) {
+                rightLeg.writeFile(packet)
+            }
         }
     }
 
@@ -1974,9 +2096,8 @@ class G2 : SGCManager() {
             // the glasses never ack it on its own.
             val dataAck = armFileAck(FileService.CID_SEND_DATA)
             sendOnFileService(ServiceID.FILE_CMD.value, FileService.sendData())
-            // WRITE_TYPE_NO_RESPONSE writes go straight at the stack; back-to-back ones get
-            // dropped as "stack busy", and dropping the raw bytes here would read as a timeout.
-            delay(BLE_PACKET_GAP_MS)
+            // No gap needed: file writes return only after retiring at the stack, so the bytes
+            // can't overrun the 0xC4 open.
             sendOnFileService(ServiceID.FILE_DATA.value, bytes)
             val dataStatus = awaitFileAck(dataAck)
             if (dataStatus != 0) {
@@ -3883,6 +4004,9 @@ class G2 : SGCManager() {
         leftGatt?.close()
         rightGatt?.disconnect()
         rightGatt?.close()
+        // Nothing will retire now; release any op mid-flight.
+        leftLeg.abort()
+        rightLeg.abort()
 
         leftInitialized = false
         rightInitialized = false
@@ -4603,6 +4727,9 @@ class G2 : SGCManager() {
                     } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                         Bridge.log("G2: Disconnected $side")
 
+                        // Nothing will retire on this leg now; release any op mid-flight.
+                        legFor(side).abort()
+
                         if (isDisconnecting) return@post
 
                         // Clear both sides to force re-discovery
@@ -4686,7 +4813,7 @@ class G2 : SGCManager() {
                                     Bridge.log("G2: Found NOTIFY char on $side")
                                     if (side == "LEFT") leftNotifyChar = char
                                     else rightNotifyChar = char
-                                    enqueueGattOp { enableNotifications(gatt, char) }
+                                    gattOpExecutor.execute { legFor(side).subscribe(gatt, char) }
                                 }
 
                                 G2BLE.FILE_WRITE -> {
@@ -4696,14 +4823,14 @@ class G2 : SGCManager() {
 
                                 G2BLE.FILE_NOTIFY -> {
                                     Bridge.log("G2: Found FILE NOTIFY char on $side")
-                                    enqueueGattOp { enableNotifications(gatt, char) }
+                                    gattOpExecutor.execute { legFor(side).subscribe(gatt, char) }
                                 }
 
                                 G2BLE.AUDIO_NOTIFY -> {
                                     Bridge.log("G2: Found AUDIO char on $side")
                                     if (side == "LEFT") leftAudioChar = char
                                     else rightAudioChar = char
-                                    enqueueGattOp { enableNotifications(gatt, char) }
+                                    gattOpExecutor.execute { legFor(side).subscribe(gatt, char) }
                                 }
                             }
                         }
@@ -4756,49 +4883,31 @@ class G2 : SGCManager() {
                 }
             }
 
+            override fun onCharacteristicWrite(
+                gatt: BluetoothGatt,
+                characteristic: BluetoothGattCharacteristic,
+                status: Int
+            ) {
+                if (status != BluetoothGatt.GATT_SUCCESS) {
+                    Bridge.log("G2: write failed on $side status=$status char=${characteristic.uuid}")
+                }
+                // Signalled inline on the callback thread: this paces every outgoing packet, and
+                // the main thread must stay out of the send path.
+                legFor(side).onCharacteristicRetired(characteristic.uuid)
+            }
+
             override fun onDescriptorWrite(
                 gatt: BluetoothGatt,
                 descriptor: BluetoothGattDescriptor,
                 status: Int
             ) {
-                mainHandler.post {
-                    // Process next queued GATT operation
-                    gattOpInProgress = false
-                    processGattOpQueue()
+                if (status != BluetoothGatt.GATT_SUCCESS) {
+                    Bridge.log(
+                        "G2: descriptor write failed on $side status=$status char=${descriptor.characteristic?.uuid}"
+                    )
                 }
+                legFor(side).onDescriptorRetired(descriptor)
             }
-        }
-    }
-
-    // GATT operation queue (Android only allows one outstanding GATT op at a time)
-    private fun enqueueGattOp(op: () -> Unit) {
-        gattOpQueue.add(op)
-        if (!gattOpInProgress) {
-            processGattOpQueue()
-        }
-    }
-
-    private fun processGattOpQueue() {
-        if (gattOpQueue.isEmpty()) return
-        gattOpInProgress = true
-        val op = gattOpQueue.removeAt(0)
-        op()
-    }
-
-    @Suppress("deprecation")
-    private fun enableNotifications(
-        gatt: BluetoothGatt,
-        characteristic: BluetoothGattCharacteristic
-    ) {
-        gatt.setCharacteristicNotification(characteristic, true)
-        val descriptor = characteristic.getDescriptor(G2BLE.CLIENT_CHARACTERISTIC_CONFIG)
-        if (descriptor != null) {
-            descriptor.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
-            gatt.writeDescriptor(descriptor)
-        } else {
-            // No descriptor, move to next op
-            gattOpInProgress = false
-            processGattOpQueue()
         }
     }
 
